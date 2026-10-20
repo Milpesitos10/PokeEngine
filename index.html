@@ -1,15 +1,65 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Calculadora de Daño Pokémon</title>
+<link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="tarjetapokemon">
-        <div class="principalpokemon">
-            
-        </div>
+<header class="top">
+  <h1>Calculadora de Daño Pokémon</h1>
+  <span id="mode" class="badge" role="status">Conectando…</span>
+  <button id="btn-collapse" type="button" aria-pressed="false">Contraer paneles</button>
+</header>
+
+<main class="layout" id="layout">
+  <section class="panel user" id="panel-user" aria-labelledby="t-user"><h2 id="t-user">Tu Pokémon</h2></section>
+
+  <section class="stage" aria-label="Arena de combate">
+    <div class="arena" id="arena">
+      <div class="hud h-rival" id="hud-rival"><b class="n">Rival</b> <span class="l"></span><div class="bar" role="img" aria-label="PS del rival"><i></i></div><small class="hp"></small></div>
+      <div class="hud h-user" id="hud-user"><b class="n">Tú</b> <span class="l"></span><div class="bar" role="img" aria-label="PS del usuario"><i></i></div><small class="hp"></small></div>
+      <div class="plat p-rival"></div><div class="plat p-user"></div>
+      <img id="spr-rival" class="spr s-rival" alt="Sprite del Pokémon rival" hidden>
+      <img id="spr-user" class="spr s-user" alt="Sprite del Pokémon del usuario" hidden>
     </div>
+    <div class="log" id="log" role="log" aria-live="polite" tabindex="0" aria-label="Registro del combate"></div>
+    <div class="ctl">
+      <button id="btn-start" class="primary" type="button">Comenzar combate</button>
+      <button id="btn-pause" type="button" disabled>Pausar</button>
+      <button id="btn-reset" type="button">Reiniciar</button>
+      <button id="btn-demo" type="button" title="Solo prueba visual; no calcula daño real">Vista previa de animaciones (demo)</button>
+    </div>
+  </section>
+
+  <section class="panel rival" id="panel-rival" aria-labelledby="t-rival"><h2 id="t-rival">Pokémon rival</h2></section>
+</main>
+
+<datalist id="dl-moves"></datalist>
+
+<template id="tpl-panel">
+  <form class="cfg" onsubmit="return false">
+    <label>Buscar por nombre o nº de Pokédex<input class="q" autocomplete="off" placeholder="Ej.: garchomp o 445"></label>
+    <datalist></datalist>
+    <p class="msg" role="status"></p>
+    <div class="info">
+      <img class="pic" alt="" width="96" height="96">
+      <div><b class="nm">Sin seleccionar</b> <small class="no"></small><div class="types"></div></div>
+    </div>
+    <div class="row">
+      <label>Nivel<input class="lv" type="number" min="1" max="100" value="50"></label>
+      <label>Naturaleza<select class="nat"></select></label>
+    </div>
+    <table>
+      <thead><tr><th>Estad.</th><th>Base</th><th>IV</th><th>EV</th><th>Total</th></tr></thead>
+      <tbody class="stats"></tbody>
+    </table>
+    <p class="ev-sum">Suma de EV: <b>0</b>/510</p>
+    <p class="err" role="alert"></p>
+    <fieldset class="moves"><legend>Movimientos</legend></fieldset>
+  </form>
+</template>
+<script src="script.js"></script>
 </body>
 </html>
