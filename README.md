@@ -1,28 +1,68 @@
-# Calculadora de Daño Pokémon — Frontend
+# Calculadora de Daño Pokémon
 
-Interfaz estática (HTML + CSS + JS sin dependencias). Estética Diamante/Perla/Platino con sprites animados de 5.ª generación (Negro/Blanco) del repositorio público PokeAPI/sprites.
+Interfaz web estática con una API Python. La API lee y escribe el catálogo normalizado en SQL Server y obtiene de PokeAPI, bajo demanda, los Pokémon y movimientos que aún no estén guardados.
 
-## Ejecutar
+## Requisitos
+
+- Python 3.10 o posterior.
+- SQL Server con el esquema de `CalculadoraPokemonDB`.
+- Microsoft ODBC Driver 18 for SQL Server instalado.
+- Acceso a internet para consultar PokeAPI y descargar sprites.
+
+## Configuración en Windows
+
+Desde la carpeta del proyecto:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements-dev.txt
+Copy-Item .env.example .env
 ```
-cd pokedmg
-python -m http.server 8000
+
+Edita `.env` localmente con el servidor y las credenciales de SQL Server. No compartas ni subas ese archivo. Configura `DB_SERVER`, `DB_NAME`, `DB_USER` y `DB_PASSWORD`. Si la tabla `ESTADOS` no tiene un estado llamado `Activo` o `Active`, define también `DB_ACTIVE_STATUS_ID` con el ID correspondiente.
+
+La tabla `ESTADISTICAS` debe tener las seis filas de estadísticas de PokeAPI (`API_ID` 1 a 6, o los nombres `hp`, `attack`, `defense`, `special-attack`, `special-defense`, `speed`). Las demás tablas y columnas usadas por la API deben corresponder al esquema existente.
+
+Arranca la aplicación:
+
+```powershell
+.\.venv\Scripts\python.exe run_api.py
 ```
-Abrir http://localhost:8000 (requiere internet para los GIF). Sin backend en `/api` la página entra en **modo demostración** (insignia amarilla): 5 Pokémon y 8 movimientos de ejemplo con datos reales de 4.ª generación.
 
-## Qué funciona ya
-Búsqueda (nombre/nº), nivel, 25 naturalezas, tabla Base/IV/EV/Total con fórmulas de 4.ª gen y validaciones (IV 0–31, EV 0–252, suma ≤ 510), 4 movimientos validados contra los datos, arena con HUD y barras de PS, animaciones (embestida, impacto, daño, debilitamiento), registro, pausa/reanudar/reiniciar, bloqueo de paneles en combate, contraer paneles y `prefers-reduced-motion`.
+Abre <http://localhost:8000>. La interfaz y la API se sirven desde el mismo origen, así que `script.js` conserva `const API='/api'`. Verifica la conexión en <http://localhost:8000/api/health>.
 
-## Contrato con el backend (pendiente)
-| Endpoint | Respuesta |
+## Preparar el catálogo de combate
+
+Antes del primer combate, sincroniza la matriz Gen. IV una vez desde la carpeta del proyecto:
+
+```powershell
+.\.venv\Scripts\python.exe sync_catalogs.py
+```
+
+El comando usa PokeAPI para reconstruir las 289 combinaciones de los 17 tipos y las inserta o actualiza en `dbo.EFECTIVIDAD_TIPOS`. Es idempotente y se puede repetir si hace falta. Los movimientos se cargan bajo demanda y el selector muestra solo los que el Pokémon puede aprender en Diamante/Perla/Platino.
+
+## API
+
+| Endpoint | Descripción |
 |---|---|
-| `GET /api/pokemon?q=` | `[{id,name}]` |
-| `GET /api/pokemon/{id}` | `{id,name,types:['fire'],base:[ps,atq,def,atesp,defesp,vel],sprites:{front,back}}` |
-| `GET /api/moves` | `[{name,type,category,power,accuracy,pp}]` |
-| `GET /api/natures` | `[{name,plus,minus}]` (índices 1–5; 0 = neutra) |
-| `POST /api/battle/simulate` | `{events:[…]}` |
+| `GET /api/pokemon?q=charizard` | Busca en SQL Server; si no existe, consulta PokeAPI y lo normaliza/guarda. |
+| `GET /api/pokemon/{id}` | Devuelve nombre, tipos, estadísticas base y sprites. |
+| `GET /api/pokemon/{id}/moves` | Lista movimientos aprendibles en Diamante/Perla/Platino; `?q=...` obtiene los datos completos de uno. |
+| `GET /api/moves` | Devuelve movimientos ya guardados. |
+| `GET /api/moves?q=earth` | Busca movimientos, los consulta en PokeAPI y los guarda en SQL Server. |
+| `GET /api/natures` | Devuelve las naturalezas admitidas por el frontend. |
+| `POST /api/battle/simulate` | Recalcula las estadísticas en el servidor y ejecuta el motor Gen. IV. |
+| `GET /api/health` | Comprueba la conexión a SQL Server. |
 
-Eventos: `{type:'log',text}` o `{type:'move',actor:'user'|'rival',text,hit,status,hp:{user,rival},extra:[],fainted}`. La interfaz **solo reproduce** estos eventos; el daño, orden, precisión y críticos los decide el motor de 4.ª gen. Todo el acceso a datos está en el objeto `data` de `script.js`. Sin credenciales de SQL Server en el frontend.
+Pokémon y movimientos se sincronizan conforme se buscan; no se descargan todos los catálogos al arrancar. Para simular combates, `EFECTIVIDAD_TIPOS` debe contener las 289 combinaciones de los 17 tipos de Gen. IV para la generación 4. La API no reemplaza esa tabla con la tabla actual de PokeAPI, porque las reglas de efectividad han cambiado desde Gen. IV.
 
-## Pendiente / simulado
-- Motor de combate: no incluido. El botón «Vista previa de animaciones (demo)» usa porcentajes ilustrativos y lo indica en el registro.
-- Animaciones específicas por movimiento: solo hay efectos genéricos (ataque/estado).
+## Pruebas del motor
+
+Desde la carpeta del proyecto:
+
+```powershell
+pytest -q
+```
+
+La API devuelve un error explícito si faltan credenciales, tablas, estadísticas o el estado activo; no envía las credenciales al navegador.

@@ -22,7 +22,7 @@ async function get(path,fallback){try{const r=await fetch(API+path);if(!r.ok)thr
 const data={
  search:q=>get('/pokemon?q='+encodeURIComponent(q),()=>DEMO.mons.filter(m=>m.name.toLowerCase().includes(q.toLowerCase())||String(m.id)===q).map(({id,name})=>({id,name}))),
  pokemon:id=>get('/pokemon/'+id,()=>DEMO.mons.find(m=>m.id==id)),
- moves:()=>get('/moves',()=>DEMO.moves),
+ pokemonMoves:(id,q='')=>get('/pokemon/'+id+'/moves'+(q?'?q='+encodeURIComponent(q):''),()=>DEMO.moves.filter(m=>m.name.toLowerCase().includes(q.toLowerCase()))),
  natures:()=>get('/natures',()=>NAT.map(([name,plus,minus])=>({name,plus,minus})))
 };
 /* ===== Estadísticas (fórmulas de 4.ª generación) ===== */
@@ -32,22 +32,28 @@ function total(base,iv,ev,L,i,nat){
  const m=nat.plus===i?1.1:nat.minus===i?0.9:1;
  return Math.floor((core+5)*m);
 }
-let natures=[],MOVES=[];const panels={};
+let natures=[];const panels={};
 /* ===== Paneles de configuración ===== */
 function makePanel(side){
  const root=$('#panel-'+side);root.append($('#tpl-panel').content.cloneNode(true));
  const q=s=>$(s,root);
- const p={side,root,mon:null,sugg:[],moves:[null,null,null,null],errs:[],totals:[],q:q('.q'),dl:q('datalist'),msg:q('.msg'),err:q('.err'),lv:q('.lv'),nat:q('.nat'),evsum:q('.ev-sum b')};
+ const p={side,root,mon:null,sugg:[],moves:[null,null,null,null],availableMoves:[],moveList:document.createElement('datalist'),errs:[],totals:[],q:q('.q'),dl:q('datalist'),msg:q('.msg'),err:q('.err'),lv:q('.lv'),nat:q('.nat'),evsum:q('.ev-sum b')};
  p.dl.id='dl-'+side;p.q.setAttribute('list',p.dl.id);
+ p.moveList.id='dl-moves-'+side;root.append(p.moveList);
  natures.forEach((n,i)=>p.nat.add(new Option(n.name+(n.plus?` (+${SH[n.plus]} −${SH[n.minus]})`:' (neutra)'),i)));
  p.rows=STATS.map((s,i)=>{const tr=q('.stats').insertRow();
   tr.innerHTML=`<th scope="row">${s}</th><td>—</td><td><input class="iv" type="number" min="0" max="31" value="31" aria-label="IV ${s}"></td><td><input class="ev" type="number" min="0" max="252" value="0" aria-label="EV ${s}"></td><td>—</td>`;
   return{b:tr.cells[1],iv:tr.cells[2].firstChild,ev:tr.cells[3].firstChild,t:tr.cells[4]}});
  const mf=q('.moves');
  [0,1,2,3].forEach(j=>{const d=document.createElement('div');d.className='mv';
-  d.innerHTML=`<input list="dl-moves" placeholder="Movimiento ${j+1}" aria-label="Movimiento ${j+1}" autocomplete="off"><span class="mi"></span>`;mf.append(d);
+  d.innerHTML=`<input list="${p.moveList.id}" placeholder="Movimiento ${j+1}" aria-label="Movimiento ${j+1}" autocomplete="off"><span class="mi"></span>`;mf.append(d);
   const inp=d.firstChild,mi=d.lastChild;
-  inp.addEventListener('change',()=>{const v=inp.value.trim().toLowerCase(),m=MOVES.find(m=>m.name.toLowerCase()===v);
+  inp.addEventListener('input',()=>{const v=inp.value.trim().toLowerCase();
+   p.moveList.replaceChildren(...p.availableMoves.filter(m=>!v||m.name.toLowerCase().includes(v)||m.api_name?.toLowerCase().includes(v)).slice(0,100).map(m=>new Option(m.name)))});
+  inp.addEventListener('change',async()=>{const v=inp.value.trim().toLowerCase(),normalized=v.replace(/\s+/g,'-');
+   const learned=p.availableMoves.some(m=>m.api_name?.toLowerCase()===normalized||m.name.toLowerCase()===normalized);
+   const found=learned&&p.mon?await data.pokemonMoves(p.mon.id,normalized):[];
+   const m=found.find(m=>m.category&&(m.name.toLowerCase()===normalized||m.api_name?.toLowerCase()===normalized));
    p.moves[j]=m||null;inp.setAttribute('aria-invalid',String(!!v&&!m));
    mi.innerHTML=m?`${chip(m.type)} ${CAT[m.category]} · Pot. ${m.power??'—'} · Prec. ${m.accuracy??'—'} · PP ${m.pp??'—'}`:(v?'Movimiento no disponible en los datos.':'')})});
  let t;p.q.addEventListener('input',()=>{clearTimeout(t);t=setTimeout(async()=>{const v=p.q.value.trim();if(!v)return;
@@ -61,9 +67,12 @@ function makePanel(side){
  return p;
 }
 async function choose(p,id){
- p.msg.textContent='Cargando…';const m=await data.pokemon(id);
+ p.msg.textContent='Cargando Pokémon y movimientos…';const m=await data.pokemon(id);
  if(!m){p.msg.textContent='No se pudo cargar el Pokémon.';return}
- p.mon=m;p.msg.textContent='';
+ p.mon=m;p.moves=[null,null,null,null];p.availableMoves=await data.pokemonMoves(id);
+ p.moveList.replaceChildren(...p.availableMoves.slice(0,100).map(m=>new Option(m.name)));
+ p.root.querySelectorAll('.mv input').forEach((input,j)=>{input.value='';input.setAttribute('aria-invalid','false');input.nextElementSibling.textContent='';p.moves[j]=null});
+ p.msg.textContent=`${p.availableMoves.length} movimientos disponibles en Diamante/Perla/Platino.`;
  const q=s=>$(s,p.root);
  q('.nm').textContent=m.name;q('.no').textContent='N.º '+String(m.id).padStart(3,'0');
  const pic=q('.pic');pic.src=m.sprites.front;pic.alt='Sprite animado de '+m.name;
@@ -120,6 +129,7 @@ async function play(events){
  const id=++run;running=true;lock(true);
  for(const e of events){
   if(e.text)log(e.text,e.actor||'sys');
+  if(e.type==='faint'&&e.fainted)$('#spr-'+e.fainted).classList.add('faint');
   if(e.type==='move'&&!await attack(e,id))return;
   if(!await wait(500,id))return}
  if(id===run){running=false;lock(false,true)}
@@ -144,15 +154,16 @@ function validate(){
   if(!p.moves.some(Boolean))bad.push(`${n}: elige al menos un movimiento.`)}
  return bad;
 }
-const cfg=p=>({pokemon_id:p.mon.id,level:p.level,nature:natures[p.nat.value].name,iv:p.iv,ev:p.ev,stats:p.totals,moves:p.moves.filter(Boolean).map(m=>m.name)});
+const cfg=p=>({pokemon_id:p.mon.id,level:p.level,nature:natures[p.nat.value].name,iv:p.iv,ev:p.ev,stats:p.totals,moves:p.moves.filter(Boolean).map(m=>m.api_name||m.name)});
 async function start(){
  if(running)return;
  const bad=validate();if(bad.length){bad.forEach(b=>log(b,'sys'));return}
  maxhp={user:panels.user.totals[0],rival:panels.rival.totals[0]};
  let res;
  try{const r=await fetch(API+'/battle/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ruleset:'gen4',user:cfg(panels.user),rival:cfg(panels.rival)})});
-  if(!r.ok)throw 0;res=await r.json()}
- catch{log('El motor de combate aún no está conectado (POST /api/battle/simulate). Puedes usar la vista previa de animaciones.','sys');return}
+  if(!r.ok){let detail;try{detail=(await r.json()).detail}catch{}throw new Error(detail||`Error HTTP ${r.status}`)}
+  res=await r.json()}
+ catch(e){log(e instanceof TypeError?'No se pudo conectar con el backend. Revisa que el servidor esté iniciado.':e.message,'sys');return}
  $('#log').replaceChildren();play(res.events);
 }
 /* Vista previa visual: porcentajes ilustrativos, NO es un resultado de combate */
@@ -167,8 +178,7 @@ function demo(){
 }
 /* ===== Arranque ===== */
 (async()=>{
- natures=await data.natures();MOVES=await data.moves();
- $('#dl-moves').replaceChildren(...MOVES.map(m=>new Option(m.name)));
+ natures=await data.natures();
  ['user','rival'].forEach(s=>panels[s]=makePanel(s));
  $('#btn-start').onclick=start;$('#btn-demo').onclick=demo;$('#btn-reset').onclick=reset;
  $('#btn-pause').onclick=e=>{paused=!paused;e.target.textContent=paused?'Reanudar':'Pausar'};
