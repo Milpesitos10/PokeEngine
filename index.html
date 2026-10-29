@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- Si sirves este HTML en otro puerto (p. ej. 8000), pon aquí la URL del backend: http://127.0.0.1:8001/api y añade el origen a CORS_ORIGINS -->
+<meta name="api-base" content="/api">
 <title>Calculadora de Daño Pokémon</title>
 <link rel="stylesheet" href="styles.css">
 </head>
@@ -36,6 +38,55 @@
   <section class="panel rival" id="panel-rival" aria-labelledby="t-rival"><h2 id="t-rival">Pokémon rival</h2></section>
 </main>
 
+<section class="panel indice" id="indice" aria-labelledby="t-idx">
+  <h2 id="t-idx">Índice de la base de datos</h2>
+  <div class="idx-body">
+    <p id="idx-count" class="msg"></p>
+    <div class="tabs" role="tablist" aria-label="Secciones del índice">
+      <button type="button" role="tab" aria-selected="true" data-tab="pokemon">Pokémon</button>
+      <button type="button" role="tab" aria-selected="false" data-tab="moves">Movimientos</button>
+      <button type="button" role="tab" aria-selected="false" data-tab="natures">Naturalezas</button>
+    </div>
+    <p id="idx-note" class="msg" role="status"></p>
+
+    <div id="pane-pokemon" role="tabpanel">
+      <div class="filters">
+        <label>Buscar<input id="ix-q" placeholder="Nombre o nº de Pokédex" autocomplete="off"></label>
+        <label>Tipo<select id="ix-type"><option value="">Todos</option></select></label>
+        <label>Generación<select id="ix-gen"><option value="">Todas</option></select></label>
+        <label>Ordenar por<select id="ix-sort">
+          <option value="number:asc">Nº de Pokédex ↑</option><option value="number:desc">Nº de Pokédex ↓</option>
+          <option value="name:asc">Nombre A–Z</option><option value="name:desc">Nombre Z–A</option>
+          <option value="total:desc">Total base ↓</option><option value="total:asc">Total base ↑</option>
+        </select></label>
+      </div>
+      <div class="idx-wrap"><table class="idx-table">
+        <thead><tr><th><span class="sr">Imagen</span></th><th>Nº</th><th>Nombre</th><th>Tipos</th><th>Gen.</th><th>Total base</th><th>Usar como</th></tr></thead>
+        <tbody id="ix-rows"></tbody></table></div>
+      <div class="pager"><button id="ix-prev" type="button">‹ Anterior</button><span id="ix-info"></span><button id="ix-next" type="button">Siguiente ›</button></div>
+    </div>
+
+    <div id="pane-moves" role="tabpanel" hidden>
+      <div class="filters">
+        <label>Buscar<input id="im-q" placeholder="Nombre del movimiento" autocomplete="off"></label>
+        <label>Tipo<select id="im-type"><option value="">Todos</option></select></label>
+        <label>Categoría<select id="im-cat"><option value="">Todas</option></select></label>
+      </div>
+      <div class="idx-wrap"><table class="idx-table">
+        <thead><tr><th>Movimiento</th><th>Tipo</th><th>Categoría</th><th>Potencia</th><th>Precisión</th><th>PP</th></tr></thead>
+        <tbody id="im-rows"></tbody></table></div>
+      <p id="im-info" class="msg"></p>
+    </div>
+
+    <div id="pane-natures" role="tabpanel" hidden>
+      <div class="idx-wrap"><table class="idx-table">
+        <thead><tr><th>Naturaleza</th><th>Sube</th><th>Baja</th></tr></thead>
+        <tbody id="in-rows"></tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<datalist id="dl-moves"></datalist>
 
 <template id="tpl-panel">
   <form class="cfg" onsubmit="return false">

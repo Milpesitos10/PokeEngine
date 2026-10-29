@@ -80,3 +80,20 @@ td:last-child{font-weight:900;color:#c2410c}
 .log p{margin:0 0 3px}.log .user{color:#1d5fd1}.log .rival{color:#c2321f}.log .sys{color:var(--mute);font-style:italic;font-weight:500}
 .ctl{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.01s!important;animation-iteration-count:1!important;transition-duration:.01s!important}}
+
+/* ===== Índice de la base de datos ===== */
+[hidden]{display:none!important}
+.indice{width:min(1532px,calc(100% - 32px));margin:0 auto 28px}
+.idx-body{padding:14px;display:grid;gap:12px}
+.tabs{display:flex;flex-wrap:wrap;gap:8px}
+.tabs button[aria-selected=true]{background:linear-gradient(#ffd15c,var(--gold))}
+.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:10px}
+.idx-wrap{overflow-x:auto}
+.idx-table th,.idx-table td{text-align:left;padding:6px 8px;vertical-align:middle}
+.idx-table td.n{text-align:right;color:var(--mute);font-weight:800}
+.idx-table .cap{text-transform:capitalize;font-weight:800}
+.idx-table img{width:40px;height:40px;image-rendering:pixelated;display:block}
+.idx-table .acts{white-space:nowrap}
+.idx-table .acts button{padding:4px 12px;font-size:.8rem;margin-right:6px}
+.pager{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:10px;color:var(--mute);font-weight:700}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}

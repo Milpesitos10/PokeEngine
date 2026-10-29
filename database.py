@@ -1,448 +1,340 @@
-"""SQL Server persistence for the normalized PokeAPI catalog."""
+"""Acceso a SQL Server (pyodbc). Una conexión por operación, consultas parametrizadas, transacciones."""
 from __future__ import annotations
 
-import os
-from contextlib import closing
+import logging
+import re
+from contextlib import contextmanager
 
-import pyodbc
+try:
+    import pyodbc
+except ImportError:  # permite importar el módulo sin ODBC (p. ej. en pruebas unitarias)
+    pyodbc = None
 
-STAT_NAMES = ("hp", "attack", "defense", "special-attack", "special-defense", "speed")
-STAT_API_IDS = {1: "hp", 2: "attack", 3: "defense", 4: "special-attack", 5: "special-defense", 6: "speed"}
-TYPE_API_IDS = {
-    1: "normal", 2: "fighting", 3: "flying", 4: "poison", 5: "ground",
-    6: "rock", 7: "bug", 8: "ghost", 9: "steel", 10: "fire",
-    11: "water", 12: "grass", 13: "electric", 14: "psychic",
-    15: "ice", 16: "dragon", 17: "dark",
-}
-TYPE_IDS = {name: api_id for api_id, name in TYPE_API_IDS.items()}
-GENERATION_IDS = {
-    "generation-i": 1, "generation-ii": 2, "generation-iii": 3,
-    "generation-iv": 4, "generation-v": 5, "generation-vi": 6,
-    "generation-vii": 7, "generation-viii": 8, "generation-ix": 9,
-}
-GEN4_TYPES = (
-    "normal", "fire", "water", "electric", "grass", "ice", "fighting",
-    "poison", "ground", "flying", "psychic", "bug", "rock", "ghost",
-    "dragon", "dark", "steel",
-)
+from config import get_settings
+
+log = logging.getLogger("pokemon.db")
 
 
-def _odbc_value(value: str) -> str:
+class DatabaseError(Exception):
+    """Error genérico de base de datos (mensaje apto para el cliente)."""
+
+
+class DatabaseUnavailable(DatabaseError):
+    """No se pudo conectar (servidor inaccesible, credenciales inválidas, falta de configuración)."""
+
+
+class IntegrityViolation(DatabaseError):
+    """Violación de clave foránea, UNIQUE o CHECK."""
+
+
+def _redact(text: str, *secrets: str) -> str:
+    for s in secrets:
+        if s:
+            text = text.replace(s, "***")
+    return re.sub(r"(PWD|Password)=[^;]*", r"\1=***", text, flags=re.I)
+
+
+def _braced(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def connect() -> pyodbc.Connection:
-    """Open a fresh connection; credentials are read only from environment variables."""
-    server = os.getenv("DB_SERVER", "").strip()
-    database = os.getenv("DB_NAME", "CalculadoraPokemonDB").strip()
-    user = os.getenv("DB_USER", "")
-    password = os.getenv("DB_PASSWORD", "")
-    if not server or not user or not password:
-        raise RuntimeError("Configura DB_SERVER, DB_USER y DB_PASSWORD en el archivo .env.")
-
-    driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
-    trust_certificate = os.getenv("DB_TRUST_SERVER_CERTIFICATE", "yes").lower()
-    connection_string = (
-        f"DRIVER={_odbc_value(driver)};"
-        f"SERVER={_odbc_value(server)};"
-        f"DATABASE={_odbc_value(database)};"
-        f"UID={_odbc_value(user)};"
-        f"PWD={_odbc_value(password)};"
-        "Encrypt=yes;"
-        f"TrustServerCertificate={'yes' if trust_certificate in {'1', 'true', 'yes'} else 'no'};"
-        "Connection Timeout=5;"
-    )
-    return pyodbc.connect(connection_string, autocommit=False)
+def build_connection_string(role: str = "read") -> tuple[str, str]:
+    """Devuelve (cadena, secreto). role: 'read' (API) o 'sync' (escritura limitada)."""
+    s = get_settings()
+    parts = [
+        f"DRIVER={_braced(s.db_driver)}",
+        f"SERVER={s.db_server}",
+        f"DATABASE={s.db_name}",
+        f"Encrypt={'yes' if s.db_encrypt else 'no'}",
+        f"TrustServerCertificate={'yes' if s.db_trust_cert else 'no'}",
+        "APP=CalculadoraPokemon",
+    ]
+    secret = ""
+    if s.db_auth == "windows":
+        parts.append("Trusted_Connection=yes")
+    else:
+        user, secret = (s.db_user, s.db_password) if role == "read" else (s.db_sync_user, s.db_sync_password)
+        if not user or not secret:
+            raise DatabaseUnavailable(f"Credenciales de SQL Server no configuradas para el rol '{role}'.")
+        parts += [f"UID={_braced(user)}", f"PWD={_braced(secret)}"]
+    return ";".join(parts), secret
 
 
-def active_status_id(cursor) -> int:
-    configured = os.getenv("DB_ACTIVE_STATUS_ID", "").strip()
-    if configured:
-        try:
-            return int(configured)
-        except ValueError as exc:
-            raise RuntimeError("DB_ACTIVE_STATUS_ID debe ser un entero.") from exc
-
-    row = cursor.execute(
-        "SELECT TOP (1) ID_ESTADO FROM dbo.ESTADOS "
-        "WHERE LOWER(NOMBRE_ESTADO) IN (N'activo', N'active')"
-    ).fetchone()
-    if row is None:
-        raise RuntimeError(
-            "No se encontró el estado Activo/Active en dbo.ESTADOS. "
-            "Configura DB_ACTIVE_STATUS_ID en .env."
-        )
-    return int(row[0])
-
-
-def ensure_generation(cursor, api_id: int, name: str, status_id: int) -> int:
-    row = cursor.execute(
-        "SELECT ID_GENERACION FROM dbo.GENERACIONES WHERE API_ID = ?", api_id
-    ).fetchone()
-    if row:
-        return int(row[0])
-    return int(cursor.execute(
-        "INSERT INTO dbo.GENERACIONES (API_ID, NOMBRE, FECHA_REGISTRO, ID_ESTADO) "
-        "OUTPUT INSERTED.ID_GENERACION VALUES (?, ?, SYSUTCDATETIME(), ?)",
-        api_id, name, status_id,
-    ).fetchone()[0])
-
-
-def ensure_version(cursor, generation_id: int, status_id: int) -> int:
-    api_name = "diamond-pearl"
-    row = cursor.execute(
-        "SELECT TOP (1) ID_VERSION FROM dbo.VERSIONES_JUEGO "
-        "WHERE ID_GENERACION = ? AND API_NOMBRE IN "
-        "(N'diamond-pearl', N'diamond', N'pearl', N'platinum') "
-        "ORDER BY CASE API_NOMBRE WHEN N'diamond-pearl' THEN 0 "
-        "WHEN N'diamond' THEN 1 WHEN N'pearl' THEN 2 ELSE 3 END",
-        generation_id,
-    ).fetchone()
-    if row:
-        return int(row[0])
-    return int(cursor.execute(
-        "INSERT INTO dbo.VERSIONES_JUEGO "
-        "(API_NOMBRE, NOMBRE_MOSTRADO, ID_GENERACION, FECHA_REGISTRO, ID_ESTADO) "
-        "OUTPUT INSERTED.ID_VERSION VALUES (?, ?, ?, SYSUTCDATETIME(), ?)",
-        api_name, "Diamante/Perla (Gen. IV)", generation_id, status_id,
-    ).fetchone()[0])
+@contextmanager
+def transaction(role: str = "read"):
+    """Cursor dentro de una transacción: commit si todo va bien, rollback si falla, cierre siempre."""
+    if pyodbc is None:
+        raise DatabaseUnavailable("pyodbc no está instalado.")
+    s = get_settings()
+    conn_str, secret = build_connection_string(role)
+    try:
+        conn = pyodbc.connect(conn_str, timeout=s.db_login_timeout, autocommit=False)
+    except pyodbc.Error as exc:
+        log.error("Fallo de conexión a SQL Server (rol=%s): %s", role, _redact(str(exc), secret))
+        raise DatabaseUnavailable("No se pudo conectar con la base de datos.") from None
+    conn.timeout = s.db_query_timeout
+    cur = conn.cursor()
+    try:
+        yield cur
+        conn.commit()
+    except pyodbc.IntegrityError as exc:
+        conn.rollback()
+        log.warning("Violación de integridad: %s", _redact(str(exc), secret))
+        raise IntegrityViolation("La operación viola una restricción de la base de datos.") from None
+    except pyodbc.Error as exc:
+        conn.rollback()
+        log.error("Error SQL: %s", _redact(str(exc), secret))
+        raise DatabaseError("Error al ejecutar la consulta.") from None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
-def _upsert_type(cursor, item: dict, status_id: int) -> int:
-    row = cursor.execute(
-        "SELECT ID_TIPO FROM dbo.TIPOS WHERE API_ID = ?", item["id"]
-    ).fetchone()
-    if row:
-        cursor.execute(
-            "UPDATE dbo.TIPOS SET NOMBRE = ?, API_URL = ?, ID_ESTADO = ? WHERE ID_TIPO = ?",
-            item["name"], item["url"], status_id, int(row[0]),
-        )
-        return int(row[0])
-    return int(cursor.execute(
-        "INSERT INTO dbo.TIPOS (API_ID, NOMBRE, API_URL, FECHA_REGISTRO, ID_ESTADO) "
-        "OUTPUT INSERTED.ID_TIPO VALUES (?, ?, ?, SYSUTCDATETIME(), ?)",
-        item["id"], item["name"], item["url"], status_id,
-    ).fetchone()[0])
+def _rows(cur) -> list[dict]:
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def save_pokemon(payload: dict) -> None:
-    with closing(connect()) as connection:
-        try:
-            cursor = connection.cursor()
-            status_id = active_status_id(cursor)
-            generation_api_id = GENERATION_IDS[payload["generation"]]
-            generation_id = ensure_generation(
-                cursor, generation_api_id, payload["generation"], status_id
+def ping() -> bool:
+    with transaction("read") as cur:
+        cur.execute("SELECT 1")
+        return cur.fetchone()[0] == 1
+
+
+def like_escape(term: str) -> str:
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("[", "\\[")
+
+
+# ---------------------------------------------------------------- escritura (solo sync_service)
+_IDENT = re.compile(r"^[A-Z][A-Z0-9_]*$")
+ALLOWED_TABLES = {
+    "ESTADOS", "GENERACIONES", "VERSIONES_JUEGO", "TIPOS", "POKEMON", "ESTADISTICAS", "POKEMON_ESTADISTICAS",
+    "POKEMON_TIPOS", "MOVIMIENTOS", "MOVIMIENTO_VERSION", "EFECTIVIDAD_TIPOS", "HABILIDADES",
+    "POKEMON_HABILIDADES", "SINCRONIZACIONES_API",
+}
+
+
+def upsert(cur, table: str, keys: dict, values: dict | None = None, update: bool = True) -> str:
+    """UPDATE-then-INSERT atómico (UPDLOCK+SERIALIZABLE). Idempotente: devuelve inserted|updated|unchanged.
+
+    Los identificadores se validan contra una lista blanca; los valores siempre van como parámetros.
+    """
+    if table not in ALLOWED_TABLES:
+        raise ValueError("Tabla no permitida.")
+    for col in (*keys, *(values or {})):
+        if not _IDENT.match(col):
+            raise ValueError("Nombre de columna no válido.")
+    where = " AND ".join(f"{k} = ?" for k in keys)
+    if values and update:
+        sets = ", ".join(f"{c} = ?" for c in values)
+        cur.execute(f"UPDATE dbo.{table} WITH (UPDLOCK, SERIALIZABLE) SET {sets} WHERE {where}", (*values.values(), *keys.values()))
+        if cur.rowcount > 0:
+            return "updated"
+    else:
+        cur.execute(f"SELECT 1 FROM dbo.{table} WITH (UPDLOCK, SERIALIZABLE) WHERE {where}", tuple(keys.values()))
+        if cur.fetchone():
+            return "unchanged"
+    cols = {**keys, **(values or {})}
+    cur.execute(f"INSERT INTO dbo.{table} ({', '.join(cols)}) VALUES ({', '.join(['?'] * len(cols))})", tuple(cols.values()))
+    return "inserted"
+
+
+def lookup(cur, table: str, id_col: str, where_col: str, value):
+    if table not in ALLOWED_TABLES or not _IDENT.match(id_col) or not _IDENT.match(where_col):
+        raise ValueError("Identificador no permitido.")
+    cur.execute(f"SELECT {id_col} FROM dbo.{table} WHERE {where_col} = ?", (value,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+# ---------------------------------------------------------------- lectura (cuenta de solo lectura)
+def search_pokemon(term: str | int, limit: int = 20) -> list[dict]:
+    with transaction("read") as cur:
+        if isinstance(term, int):
+            cur.execute("SELECT TOP (?) API_ID AS id, NOMBRE AS name FROM dbo.POKEMON WHERE ID_ESTADO = 1 AND API_ID = ?", (limit, term))
+        else:
+            cur.execute(
+                "SELECT TOP (?) API_ID AS id, NOMBRE AS name FROM dbo.POKEMON "
+                "WHERE ID_ESTADO = 1 AND NOMBRE LIKE ? ESCAPE '\\' ORDER BY API_ID",
+                (limit, f"%{like_escape(term)}%"),
             )
-            row = cursor.execute(
-                "SELECT ID_POKEMON FROM dbo.POKEMON WHERE API_ID = ?", payload["id"]
-            ).fetchone()
-            if row:
-                pokemon_id = int(row[0])
-                cursor.execute(
-                    "UPDATE dbo.POKEMON SET NOMBRE = ?, ALTURA = ?, PESO = ?, "
-                    "API_URL = ?, ID_GENERACION = ?, ID_ESTADO = ? WHERE ID_POKEMON = ?",
-                    payload["name"], payload["height"], payload["weight"],
-                    payload["url"], generation_id, status_id, pokemon_id,
-                )
-            else:
-                pokemon_id = int(cursor.execute(
-                    "INSERT INTO dbo.POKEMON "
-                    "(API_ID, NOMBRE, ALTURA, PESO, API_URL, ID_GENERACION, FECHA_REGISTRO, ID_ESTADO) "
-                    "OUTPUT INSERTED.ID_POKEMON VALUES (?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), ?)",
-                    payload["id"], payload["name"], payload["height"], payload["weight"],
-                    payload["url"], generation_id, status_id,
-                ).fetchone()[0])
-
-            cursor.execute("DELETE FROM dbo.POKEMON_TIPOS WHERE ID_POKEMON = ?", pokemon_id)
-            for slot, item in enumerate(payload["types"], 1):
-                type_id = _upsert_type(cursor, item, status_id)
-                cursor.execute(
-                    "INSERT INTO dbo.POKEMON_TIPOS "
-                    "(ID_POKEMON, ID_TIPO, SLOT, FECHA_REGISTRO, ID_ESTADO) "
-                    "VALUES (?, ?, ?, SYSUTCDATETIME(), ?)",
-                    pokemon_id, type_id, slot, status_id,
-                )
-
-            cursor.execute(
-                "DELETE FROM dbo.POKEMON_ESTADISTICAS WHERE ID_POKEMON = ?", pokemon_id
-            )
-            for name, stat_data in payload["stats"].items():
-                stat = cursor.execute(
-                    "SELECT ID_ESTADISTICA FROM dbo.ESTADISTICAS "
-                    "WHERE API_ID = ? OR NOMBRE = ?",
-                    stat_data["id"], name,
-                ).fetchone()
-                if stat is None:
-                    raise RuntimeError(
-                        f"Falta la estadística '{name}' en dbo.ESTADISTICAS; "
-                        "carga primero el catálogo de estadísticas."
-                    )
-                cursor.execute(
-                    "INSERT INTO dbo.POKEMON_ESTADISTICAS "
-                    "(ID_POKEMON, ID_ESTADISTICA, VALOR_BASE, FECHA_REGISTRO, ID_ESTADO) "
-                    "VALUES (?, ?, ?, SYSUTCDATETIME(), ?)",
-                    pokemon_id, int(stat[0]), stat_data["value"], status_id,
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        return _rows(cur)
 
 
 def get_pokemon(api_id: int) -> dict | None:
-    with closing(connect()) as connection:
-        cursor = connection.cursor()
-        pokemon = cursor.execute(
-            "SELECT ID_POKEMON, API_ID, NOMBRE, API_URL FROM dbo.POKEMON WHERE API_ID = ?",
-            api_id,
-        ).fetchone()
-        if pokemon is None:
-            return None
-        pokemon_id = int(pokemon[0])
-        types = cursor.execute(
-            "SELECT t.API_ID, t.NOMBRE FROM dbo.POKEMON_TIPOS pt "
-            "JOIN dbo.TIPOS t ON t.ID_TIPO = pt.ID_TIPO "
-            "WHERE pt.ID_POKEMON = ? ORDER BY pt.SLOT",
-            pokemon_id,
-        ).fetchall()
-        stats = cursor.execute(
-            "SELECT e.API_ID, e.NOMBRE, pe.VALOR_BASE FROM dbo.POKEMON_ESTADISTICAS pe "
-            "JOIN dbo.ESTADISTICAS e ON e.ID_ESTADISTICA = pe.ID_ESTADISTICA "
-            "WHERE pe.ID_POKEMON = ?",
-            pokemon_id,
-        ).fetchall()
-    values = {}
-    for row in stats:
-        stat_name = STAT_API_IDS.get(int(row[0])) if row[0] is not None else None
-        if stat_name is None:
-            stat_name = str(row[1]).replace("_", "-").lower()
-        values[stat_name] = int(row[2])
-    if any(name not in values for name in STAT_NAMES):
-        raise RuntimeError(
-            f"El Pokémon {api_id} no tiene las seis estadísticas normalizadas en SQL Server."
+    with transaction("read") as cur:
+        cur.execute(
+            "SELECT P.ID_POKEMON, P.API_ID, P.NOMBRE, P.ALTURA, P.PESO, G.API_ID AS GEN FROM dbo.POKEMON P "
+            "LEFT JOIN dbo.GENERACIONES G ON G.ID_GENERACION = P.ID_GENERACION WHERE P.API_ID = ? AND P.ID_ESTADO = 1",
+            (api_id,),
         )
-    return {
-        "id": int(pokemon[1]),
-        "name": str(pokemon[2]),
-        "types": [
-            TYPE_API_IDS.get(int(row[0]), str(row[1]).lower())
-            for row in types
-        ],
-        "base": [values[name] for name in STAT_NAMES],
-        "url": str(pokemon[3] or ""),
-    }
+        row = cur.fetchone()
+        if not row:
+            return None
+        pid = row.ID_POKEMON
+        out = {"id": row.API_ID, "name": row.NOMBRE, "height": row.ALTURA, "weight": row.PESO, "generation": row.GEN}
+        cur.execute(
+            "SELECT E.NOMBRE, PE.VALOR_BASE FROM dbo.POKEMON_ESTADISTICAS PE JOIN dbo.ESTADISTICAS E "
+            "ON E.ID_ESTADISTICA = PE.ID_ESTADISTICA WHERE PE.ID_POKEMON = ? AND PE.ID_ESTADO = 1 AND E.ID_ESTADO = 1",
+            (pid,),
+        )
+        out["base_stats"] = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT T.NOMBRE FROM dbo.POKEMON_TIPOS PT JOIN dbo.TIPOS T ON T.ID_TIPO = PT.ID_TIPO "
+            "WHERE PT.ID_POKEMON = ? AND PT.ID_ESTADO = 1 ORDER BY PT.SLOT",
+            (pid,),
+        )
+        out["types"] = [r[0] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT H.NOMBRE, PH.SLOT, PH.ES_OCULTA FROM dbo.POKEMON_HABILIDADES PH JOIN dbo.HABILIDADES H "
+            "ON H.ID_HABILIDAD = PH.ID_HABILIDAD WHERE PH.ID_POKEMON = ? AND PH.ID_ESTADO = 1 ORDER BY PH.SLOT",
+            (pid,),
+        )
+        out["abilities"] = [{"name": r[0], "slot": r[1], "hidden": bool(r[2])} for r in cur.fetchall()]
+        return out
 
 
-def search_pokemon(query: str, limit: int = 20) -> list[dict]:
-    with closing(connect()) as connection:
-        cursor = connection.cursor()
-        if query.isdigit():
-            rows = cursor.execute(
-                "SELECT TOP (?) API_ID, NOMBRE FROM dbo.POKEMON "
-                "WHERE API_ID = ? AND API_ID BETWEEN 1 AND 493 ORDER BY API_ID",
-                    limit, int(query),
-            ).fetchall()
+_MOVE_SELECT = (
+    "SELECT M.API_ID AS id, M.NOMBRE AS name, T.NOMBRE AS type, MV.CATEGORIA AS category, MV.POTENCIA AS power, "
+    "MV.PRECISION_MOVIMIENTO AS accuracy, MV.PP AS pp FROM dbo.MOVIMIENTOS M "
+    "JOIN dbo.MOVIMIENTO_VERSION MV ON MV.ID_MOVIMIENTO = M.ID_MOVIMIENTO "
+    "JOIN dbo.VERSIONES_JUEGO V ON V.ID_VERSION = MV.ID_VERSION "
+    "LEFT JOIN dbo.TIPOS T ON T.ID_TIPO = MV.ID_TIPO "
+    "WHERE V.API_NOMBRE = ? AND M.ID_ESTADO = 1 AND MV.ID_ESTADO = 1 AND V.ID_ESTADO = 1"
+)
+
+
+def search_moves(version: str, term: str | None, limit: int) -> list[dict]:
+    with transaction("read") as cur:
+        if term:
+            cur.execute(_MOVE_SELECT.replace("SELECT ", "SELECT TOP (?) ", 1) + " AND M.NOMBRE LIKE ? ESCAPE '\\' ORDER BY M.NOMBRE",
+                        (limit, version, f"%{like_escape(term)}%"))
         else:
-            rows = cursor.execute(
-                "SELECT TOP (?) API_ID, NOMBRE FROM dbo.POKEMON "
-                "WHERE NOMBRE LIKE ? AND API_ID BETWEEN 1 AND 493 ORDER BY NOMBRE",
-                limit, f"%{query}%",
-            ).fetchall()
-    return [{"id": int(row[0]), "name": str(row[1])} for row in rows]
+            cur.execute(_MOVE_SELECT.replace("SELECT ", "SELECT TOP (?) ", 1) + " ORDER BY M.NOMBRE", (limit, version))
+        return _rows(cur)
 
 
-def save_move(payload: dict) -> None:
-    with closing(connect()) as connection:
-        try:
-            cursor = connection.cursor()
-            status_id = active_status_id(cursor)
-            generation_id = ensure_generation(cursor, 4, "generation-iv", status_id)
-            version_id = ensure_version(cursor, generation_id, status_id)
-            type_id = None
-            if payload["type"]:
-                type_id = _upsert_type(cursor, payload["type"], status_id)
-            row = cursor.execute(
-                "SELECT ID_MOVIMIENTO FROM dbo.MOVIMIENTOS WHERE API_ID = ?", payload["id"]
-            ).fetchone()
-            if row:
-                move_id = int(row[0])
-                cursor.execute(
-                    "UPDATE dbo.MOVIMIENTOS SET NOMBRE = ?, API_URL = ?, ID_ESTADO = ? "
-                    "WHERE ID_MOVIMIENTO = ?",
-                    payload["name"], payload["url"], status_id, move_id,
-                )
-            else:
-                move_id = int(cursor.execute(
-                    "INSERT INTO dbo.MOVIMIENTOS (API_ID, NOMBRE, API_URL, FECHA_REGISTRO, ID_ESTADO) "
-                    "OUTPUT INSERTED.ID_MOVIMIENTO VALUES (?, ?, ?, SYSUTCDATETIME(), ?)",
-                    payload["id"], payload["name"], payload["url"], status_id,
-                ).fetchone()[0])
-            exists = cursor.execute(
-                "SELECT 1 FROM dbo.MOVIMIENTO_VERSION WHERE ID_MOVIMIENTO = ? AND ID_VERSION = ?",
-                move_id, version_id,
-            ).fetchone()
-            if exists:
-                cursor.execute(
-                    "UPDATE dbo.MOVIMIENTO_VERSION SET ID_TIPO = ?, POTENCIA = ?, "
-                    "PRECISION_MOVIMIENTO = ?, PP = ?, CATEGORIA = ?, ID_ESTADO = ? "
-                    "WHERE ID_MOVIMIENTO = ? AND ID_VERSION = ?",
-                    type_id, payload["power"], payload["accuracy"], payload["pp"],
-                    payload["category"], status_id, move_id, version_id,
-                )
-            else:
-                cursor.execute(
-                    "INSERT INTO dbo.MOVIMIENTO_VERSION "
-                    "(ID_MOVIMIENTO, ID_VERSION, ID_TIPO, POTENCIA, PRECISION_MOVIMIENTO, "
-                    "PP, CATEGORIA, FECHA_REGISTRO, ID_ESTADO) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), ?)",
-                    move_id, version_id, type_id, payload["power"], payload["accuracy"],
-                    payload["pp"], payload["category"], status_id,
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+def get_moves_by_names(version: str, names: list[str]) -> list[dict]:
+    if not names:
+        return []
+    marks = ", ".join(["?"] * len(names))
+    with transaction("read") as cur:
+        cur.execute(_MOVE_SELECT + f" AND M.NOMBRE IN ({marks})", (version, *names))
+        return _rows(cur)
 
 
-def list_moves(query: str = "", limit: int = 100) -> list[dict]:
-    with closing(connect()) as connection:
-        cursor = connection.cursor()
-        pattern = f"%{query}%"
-        rows = cursor.execute(
-            "WITH ranked AS ("
-            " SELECT m.API_ID, m.NOMBRE, t.API_ID AS TYPE_API_ID, t.NOMBRE AS TYPE_NAME, "
-            " mv.CATEGORIA, mv.POTENCIA, mv.PRECISION_MOVIMIENTO, mv.PP, "
-            " ROW_NUMBER() OVER (PARTITION BY m.ID_MOVIMIENTO ORDER BY "
-            " CASE v.API_NOMBRE WHEN N'diamond-pearl' THEN 0 WHEN N'diamond' THEN 1 "
-            " WHEN N'pearl' THEN 2 ELSE 3 END) AS rn "
-            " FROM dbo.MOVIMIENTOS m "
-            " JOIN dbo.MOVIMIENTO_VERSION mv ON mv.ID_MOVIMIENTO = m.ID_MOVIMIENTO "
-            " JOIN dbo.VERSIONES_JUEGO v ON v.ID_VERSION = mv.ID_VERSION "
-            " LEFT JOIN dbo.TIPOS t ON t.ID_TIPO = mv.ID_TIPO "
-            " WHERE v.ID_GENERACION = (SELECT ID_GENERACION FROM dbo.GENERACIONES WHERE API_ID = 4)"
-            ") SELECT TOP (?) API_ID, NOMBRE, TYPE_API_ID, TYPE_NAME, CATEGORIA, "
-            "POTENCIA, PRECISION_MOVIMIENTO, PP FROM ranked "
-            "WHERE rn = 1 AND NOMBRE LIKE ? ORDER BY NOMBRE",
-            limit, pattern,
-        ).fetchall()
-    return [
-        {"api_id": int(row[0]), "api_name": str(row[1]), "name": str(row[1]),
-         "type": TYPE_API_IDS.get(int(row[2]), str(row[3]).lower()) if row[2] is not None else None,
-         "category": row[4], "power": row[5], "accuracy": row[6], "pp": row[7]}
-        for row in rows
-    ]
+def get_multipliers(gen_api_id: int, attack_types: list[str], defend_types: list[str]) -> dict[tuple[str, str], float]:
+    if not attack_types or not defend_types:
+        return {}
+    qa, qd = ", ".join(["?"] * len(attack_types)), ", ".join(["?"] * len(defend_types))
+    with transaction("read") as cur:
+        cur.execute(
+            "SELECT TA.NOMBRE, TD.NOMBRE, E.MULTIPLICADOR FROM dbo.EFECTIVIDAD_TIPOS E "
+            "JOIN dbo.TIPOS TA ON TA.ID_TIPO = E.ID_TIPO_ATAQUE JOIN dbo.TIPOS TD ON TD.ID_TIPO = E.ID_TIPO_DEFENSA "
+            "JOIN dbo.GENERACIONES G ON G.ID_GENERACION = E.ID_GENERACION "
+            f"WHERE G.API_ID = ? AND E.ID_ESTADO = 1 AND TA.NOMBRE IN ({qa}) AND TD.NOMBRE IN ({qd})",
+            (gen_api_id, *attack_types, *defend_types),
+        )
+        return {(r[0], r[1]): float(r[2]) for r in cur.fetchall()}
 
 
-def type_chart_ready() -> bool:
-    with closing(connect()) as connection:
-        row = connection.cursor().execute(
-            "SELECT COUNT(DISTINCT CONCAT(e.ID_TIPO_ATAQUE, ':', e.ID_TIPO_DEFENSA)) "
-            "FROM dbo.EFECTIVIDAD_TIPOS e "
-            "JOIN dbo.GENERACIONES g ON g.ID_GENERACION = e.ID_GENERACION "
-            "JOIN dbo.TIPOS a ON a.ID_TIPO = e.ID_TIPO_ATAQUE "
-            "JOIN dbo.TIPOS d ON d.ID_TIPO = e.ID_TIPO_DEFENSA "
-            "WHERE g.API_ID = 4 AND a.API_ID BETWEEN 1 AND 17 "
-            "AND d.API_ID BETWEEN 1 AND 17"
-        ).fetchone()
-    return bool(row and int(row[0]) == len(GEN4_TYPES) ** 2)
+# ---------------------------------------------------------------- índice (Pokédex de la BD)
+SORTS = {"number": "P.API_ID", "name": "P.NOMBRE", "total": "TOTAL"}
+_DEX_FROM = "FROM dbo.POKEMON P LEFT JOIN dbo.GENERACIONES G ON G.ID_GENERACION = P.ID_GENERACION"
 
 
-def save_gen4_type_chart(chart: dict[tuple[str, str], float], types: list[dict]) -> None:
-    if len(chart) != len(GEN4_TYPES) ** 2:
-        raise ValueError("La matriz de efectividad debe incluir exactamente 289 combinaciones.")
-    with closing(connect()) as connection:
-        try:
-            cursor = connection.cursor()
-            status_id = active_status_id(cursor)
-            generation_id = ensure_generation(cursor, 4, "generation-iv", status_id)
-            type_db_ids = {
-                item["name"]: _upsert_type(cursor, item, status_id)
-                for item in types
-            }
-            if set(type_db_ids) != set(GEN4_TYPES):
-                raise ValueError("El catálogo debe incluir los 17 tipos de Gen. IV.")
-            for attack in GEN4_TYPES:
-                for defense in GEN4_TYPES:
-                    attack_id = type_db_ids[attack]
-                    defense_id = type_db_ids[defense]
-                    multiplier = chart[(attack, defense)]
-                    exists = cursor.execute(
-                        "SELECT 1 FROM dbo.EFECTIVIDAD_TIPOS "
-                        "WHERE ID_TIPO_ATAQUE = ? AND ID_TIPO_DEFENSA = ? AND ID_GENERACION = ?",
-                        attack_id, defense_id, generation_id,
-                    ).fetchone()
-                    if exists:
-                        cursor.execute(
-                            "UPDATE dbo.EFECTIVIDAD_TIPOS SET MULTIPLICADOR = ?, ID_ESTADO = ? "
-                            "WHERE ID_TIPO_ATAQUE = ? AND ID_TIPO_DEFENSA = ? AND ID_GENERACION = ?",
-                            multiplier, status_id, attack_id, defense_id, generation_id,
-                        )
-                    else:
-                        cursor.execute(
-                            "INSERT INTO dbo.EFECTIVIDAD_TIPOS "
-                            "(ID_TIPO_ATAQUE, ID_TIPO_DEFENSA, ID_GENERACION, MULTIPLICADOR, "
-                            "FECHA_REGISTRO, ID_ESTADO) VALUES (?, ?, ?, ?, SYSUTCDATETIME(), ?)",
-                            attack_id, defense_id, generation_id, multiplier, status_id,
-                        )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+def _pokedex_order(sort: str, order: str) -> str:
+    """ORDER BY sin columnas repetidas (SQL Server lo rechaza): desempata por número solo si no se ordena ya por él."""
+    col, direction = SORTS.get(sort, "P.API_ID"), ("DESC" if order == "desc" else "ASC")
+    return f"{col} {direction}" if col == "P.API_ID" else f"{col} {direction}, P.API_ID"
 
 
-def move_for_battle(api_name: str, generation: int = 4) -> dict | None:
-    with closing(connect()) as connection:
-        row = connection.cursor().execute(
-            "SELECT TOP (1) m.API_ID, m.NOMBRE, t.API_ID, t.NOMBRE, "
-            "mv.CATEGORIA, mv.POTENCIA, mv.PRECISION_MOVIMIENTO, mv.PP "
-            "FROM dbo.MOVIMIENTOS m "
-            "JOIN dbo.MOVIMIENTO_VERSION mv ON mv.ID_MOVIMIENTO = m.ID_MOVIMIENTO "
-            "JOIN dbo.VERSIONES_JUEGO v ON v.ID_VERSION = mv.ID_VERSION "
-            "LEFT JOIN dbo.TIPOS t ON t.ID_TIPO = mv.ID_TIPO "
-            "WHERE m.NOMBRE = ? AND v.ID_GENERACION = "
-            "(SELECT ID_GENERACION FROM dbo.GENERACIONES WHERE API_ID = 4) "
-            "ORDER BY CASE v.API_NOMBRE WHEN N'diamond-pearl' THEN 0 "
-            "WHEN N'diamond' THEN 1 WHEN N'pearl' THEN 2 ELSE 3 END",
-            api_name,
-        ).fetchone()
-    if row is None:
-        return None
-    type_name = (
-        TYPE_API_IDS.get(int(row[2]), str(row[3]).lower()) if row[2] is not None else None
-    )
-    return {"id": int(row[0]), "name": str(row[1]), "type": type_name,
-            "category": row[4], "power": row[5], "accuracy": row[6], "pp": row[7]}
+def _pokedex_filters(term, type_name, gen) -> tuple[str, list]:
+    where, params = ["P.ID_ESTADO = 1"], []
+    if term is not None:
+        if isinstance(term, int):
+            where.append("P.API_ID = ?")
+            params.append(term)
+        else:
+            where.append("P.NOMBRE LIKE ? ESCAPE '\\'")
+            params.append(f"%{like_escape(term)}%")
+    if type_name:
+        where.append("EXISTS (SELECT 1 FROM dbo.POKEMON_TIPOS PT JOIN dbo.TIPOS T ON T.ID_TIPO = PT.ID_TIPO "
+                     "WHERE PT.ID_POKEMON = P.ID_POKEMON AND PT.ID_ESTADO = 1 AND T.NOMBRE = ?)")
+        params.append(type_name)
+    if gen:
+        where.append("G.API_ID = ?")
+        params.append(gen)
+    return " AND ".join(where), params
 
 
-def move_effectiveness(move_type: str, defender_types: list[str]) -> float | None:
-    with closing(connect()) as connection:
-        cursor = connection.cursor()
-        attack_api_id = TYPE_IDS.get(move_type)
-        if attack_api_id is None:
-            return None
-        attack = cursor.execute(
-            "SELECT ID_TIPO FROM dbo.TIPOS WHERE API_ID = ?", attack_api_id
-        ).fetchone()
-        if attack is None:
-            return None
-        multiplier = 1.0
-        for name in defender_types:
-            defense_api_id = TYPE_IDS.get(name)
-            if defense_api_id is None:
-                return None
-            defense = cursor.execute(
-                "SELECT ID_TIPO FROM dbo.TIPOS WHERE API_ID = ?", defense_api_id
-            ).fetchone()
-            if defense is None:
-                return None
-            value = cursor.execute(
-                "SELECT e.MULTIPLICADOR FROM dbo.EFECTIVIDAD_TIPOS e "
-                "JOIN dbo.GENERACIONES g ON g.ID_GENERACION = e.ID_GENERACION "
-                "WHERE e.ID_TIPO_ATAQUE = ? AND e.ID_TIPO_DEFENSA = ? AND g.API_ID = 4",
-                int(attack[0]), int(defense[0]),
-            ).fetchone()
-            if value is None:
-                return None
-            multiplier *= float(value[0])
-    return multiplier
+def pokedex(term, type_name, gen, sort: str, order: str, limit: int, offset: int) -> tuple[int, list[dict]]:
+    where, params = _pokedex_filters(term, type_name, gen)
+    direction = "DESC" if order == "desc" else "ASC"
+    with transaction("read") as cur:
+        cur.execute(f"SELECT COUNT(*) {_DEX_FROM} WHERE {where}", params)
+        total = cur.fetchone()[0]
+        cur.execute(
+            "SELECT P.API_ID AS id, P.NOMBRE AS name, G.API_ID AS generation, (SELECT SUM(PE.VALOR_BASE) FROM "
+            "dbo.POKEMON_ESTADISTICAS PE WHERE PE.ID_POKEMON = P.ID_POKEMON AND PE.ID_ESTADO = 1) AS total "
+            f"{_DEX_FROM} WHERE {where} ORDER BY {_pokedex_order(sort, order)} "
+            "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", (*params, offset, limit))
+        items = _rows(cur)
+        for it in items:
+            it["types"] = []
+        if items:
+            by_id = {it["id"]: it for it in items}
+            cur.execute("SELECT P.API_ID, T.NOMBRE FROM dbo.POKEMON_TIPOS PT JOIN dbo.POKEMON P ON P.ID_POKEMON = PT.ID_POKEMON "
+                        "JOIN dbo.TIPOS T ON T.ID_TIPO = PT.ID_TIPO WHERE PT.ID_ESTADO = 1 AND P.API_ID IN "
+                        f"({', '.join(['?'] * len(by_id))}) ORDER BY P.API_ID, PT.SLOT", list(by_id))
+            for api_id, tname in cur.fetchall():
+                by_id[api_id]["types"].append(tname)
+    return total, items
+
+
+def catalogs(version: str) -> dict:
+    """Valores para los filtros del índice, leídos de TIPOS, GENERACIONES y MOVIMIENTO_VERSION."""
+    with transaction("read") as cur:
+        cur.execute("SELECT NOMBRE FROM dbo.TIPOS WHERE ID_ESTADO = 1 ORDER BY API_ID")
+        types = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT API_ID, NOMBRE FROM dbo.GENERACIONES WHERE ID_ESTADO = 1 ORDER BY API_ID")
+        gens = [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT MV.CATEGORIA FROM dbo.MOVIMIENTO_VERSION MV JOIN dbo.VERSIONES_JUEGO V "
+                    "ON V.ID_VERSION = MV.ID_VERSION WHERE V.API_NOMBRE = ? AND MV.ID_ESTADO = 1 AND MV.CATEGORIA IS NOT NULL "
+                    "ORDER BY MV.CATEGORIA", (version,))
+        cats = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT COUNT(*) FROM dbo.POKEMON WHERE ID_ESTADO = 1")
+        n_pokemon = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT M.ID_MOVIMIENTO) FROM dbo.MOVIMIENTOS M JOIN dbo.MOVIMIENTO_VERSION MV "
+                    "ON MV.ID_MOVIMIENTO = M.ID_MOVIMIENTO JOIN dbo.VERSIONES_JUEGO V ON V.ID_VERSION = MV.ID_VERSION "
+                    "WHERE V.API_NOMBRE = ? AND M.ID_ESTADO = 1 AND MV.ID_ESTADO = 1", (version,))
+        n_moves = cur.fetchone()[0]
+    return {"types": types, "generations": gens, "move_categories": cats, "version": version,
+            "counts": {"pokemon": n_pokemon, "moves": n_moves}}
+
+
+def fetch_count(table: str) -> int:
+    if table not in ALLOWED_TABLES:
+        raise ValueError("Tabla no permitida.")
+    with transaction("read") as cur:
+        cur.execute(f"SELECT COUNT(*) FROM dbo.{table}")
+        return cur.fetchone()[0]
+
+
+EXPECTED_TABLES = sorted(ALLOWED_TABLES)
+
+
+def schema_diagnostics() -> dict:
+    """Solo lectura: columnas reales y tablas esperadas ausentes (sección 3 del encargo)."""
+    with transaction("read") as cur:
+        cur.execute(
+            "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = 'dbo' ORDER BY TABLE_NAME, ORDINAL_POSITION"
+        )
+        tables: dict[str, list] = {}
+        for t, c, d, n in cur.fetchall():
+            tables.setdefault(t, []).append(f"{c} {d}{'' if n == 'YES' else ' NOT NULL'}")
+    return {"tables": tables, "missing": [t for t in EXPECTED_TABLES if t not in tables]}
